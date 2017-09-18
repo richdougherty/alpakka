@@ -9,7 +9,6 @@ import javax.jms._
 import akka.stream.stage.{GraphStage, GraphStageLogic, OutHandler, StageLogging}
 import akka.stream.{ActorAttributes, Attributes, Outlet, SourceShape}
 
-import scala.collection.mutable
 import scala.util.{Failure, Success}
 
 final class JmsSourceStage(settings: JmsSourceSettings) extends GraphStage[SourceShape[Message]] {
@@ -32,44 +31,35 @@ final class JmsSourceStage(settings: JmsSourceSettings) extends GraphStage[Sourc
           case d => d
         }
 
-      private val bufferSize = settings.bufferSize
-      private val queue = mutable.Queue[Message]()
-      private val backpressure = new Semaphore(bufferSize)
+      /**
+       * Permits to control push volume. Available permits are equal to the
+       * number of unfulfilled pulls.
+       */
+      private val pushPermits = new Semaphore(0)
 
-      private val handleError = getAsyncCallback[Throwable](e => {
+      private val asyncFail = getAsyncCallback[Throwable](e => {
         fail(out, e)
       })
 
-      private val handleMessage = getAsyncCallback[Message](msg => {
-        require(queue.size <= bufferSize)
-        if (isAvailable(out)) {
-          pushMessage(msg)
-        } else {
-          queue.enqueue(msg)
-        }
+      private val asyncPush = getAsyncCallback[Message](msg => {
+        push(out, msg)
       })
 
       override def preStart(): Unit =
         initSessionAsync(getDispatcher)
-
-      private def pushMessage(msg: Message): Unit = {
-        push(out, msg)
-        backpressure.release()
-      }
 
       override private[jms] def onSessionOpened(): Unit =
         jmsSession.createConsumer(settings.selector).onComplete {
           case Success(consumer) =>
             consumer.setMessageListener(new MessageListener {
               override def onMessage(message: Message): Unit = {
-                backpressure.acquire()
+                pushPermits.acquire() // Acquire a permit to push this message
                 try {
                   message.acknowledge()
-                  handleMessage.invoke(message)
+                  asyncPush.invoke(message)
                 } catch {
                   case e: JMSException =>
-                    backpressure.release()
-                    handleError.invoke(e)
+                    asyncFail.invoke(e)
                 }
               }
             })
@@ -79,16 +69,12 @@ final class JmsSourceStage(settings: JmsSourceSettings) extends GraphStage[Sourc
 
       setHandler(out, new OutHandler {
         override def onPull(): Unit =
-          if (queue.nonEmpty) {
-            pushMessage(queue.dequeue())
-          }
+          pushPermits.release() // Release a permit to push a message
       })
 
-      override def postStop(): Unit = {
-        queue.clear()
-        Option(jmsSession).foreach(_.closeSessionAsync().onFailure {
+      override def postStop(): Unit =
+        Option(jmsSession).foreach(_.closeSessionAsync().failed.foreach {
           case e => log.error(e, "Error closing jms session")
         })
-      }
     }
 }
